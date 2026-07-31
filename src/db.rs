@@ -1,20 +1,63 @@
+use chrono::Utc;
+use crc32fast::Hasher;
 use std::fs;
-use std::io::BufRead;
+use std::io;
 use std::io::BufWriter;
+use std::io::Read;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::{collections::HashMap, fs::File, io::BufReader};
-use strum::EnumString;
 
 use crate::file::open_log;
 
-#[derive(EnumString)]
-#[strum(serialize_all = "UPPERCASE")]
-enum Command {
-    Set,
-    Remove,
+#[derive(Debug, Clone, Copy)]
+#[repr(u8)]
+enum OperationType {
+    Set = 1,
+    Remove = 2,
+}
+
+impl TryFrom<u8> for OperationType {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(OperationType::Set),
+            2 => Ok(OperationType::Remove),
+            _ => Err(()),
+        }
+    }
+}
+
+struct BinaryLog {
+    crc: u32,
+    timestamp: i64,
+    operation_type: OperationType,
+    key: Vec<u8>,
+    val: Vec<u8>,
+}
+
+impl BinaryLog {
+    fn set(key: &str, value: &str) -> Self {
+        Self {
+            crc: 0,
+            timestamp: Utc::now().timestamp(),
+            operation_type: OperationType::Set,
+            key: key.as_bytes().to_vec(),
+            val: value.as_bytes().to_vec(),
+        }
+    }
+
+    fn remove(key: &str) -> Self {
+        Self {
+            crc: 0,
+            timestamp: Utc::now().timestamp(),
+            operation_type: OperationType::Remove,
+            key: key.as_bytes().to_vec(),
+            val: Vec::new(),
+        }
+    }
 }
 
 pub struct DB {
@@ -33,23 +76,32 @@ impl DB {
 
         if path.exists() {
             let file = File::open(&path)?;
-            let reader = BufReader::new(file);
+            let mut reader = BufReader::new(file);
 
-            for line in reader.lines() {
-                let line = line?;
-                let mut parts = line.split_whitespace();
-                let first = parts.next().ok_or("missing command")?;
-                let command = Command::from_str(first)?;
-                match command {
-                    Command::Set => {
-                        let key = parts.next().ok_or("missing key")?;
-                        let value = parts.next().ok_or("missing value")?;
-                        map.insert(key.to_string(), value.to_string());
+            loop {
+                let mut len_buf = [0u8; 4];
+
+                match reader.read_exact(&mut len_buf) {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => {
+                        println!("Another I/O error occurred: {}", e);
                     }
-                    Command::Remove => {
-                        let key = parts.next().ok_or("missing key")?;
-                        map.remove(key);
+                }
+
+                let record_len = u32::from_le_bytes(len_buf) as usize;
+
+                let mut record = vec![0u8; record_len];
+
+                reader.read_exact(&mut record)?;
+
+                let log = DB::deserialize(record)?;
+
+                match log.operation_type {
+                    OperationType::Set => {
+                        map.insert(String::from_utf8(log.key)?, String::from_utf8(log.val)?)
                     }
+                    OperationType::Remove => map.remove(&String::from_utf8(log.key)?),
                 };
             }
         }
@@ -62,7 +114,11 @@ impl DB {
     }
 
     pub fn set(&mut self, key: String, value: String) -> Result<(), Box<dyn std::error::Error>> {
-        self.append_log(&format!("SET {} {}", key, value))?;
+        let log = BinaryLog::set(&key, &value);
+        let serialized = self.serialize(&log);
+
+        self.append_log(&serialized)?;
+
         self.map.insert(key, value);
 
         Ok(())
@@ -73,7 +129,11 @@ impl DB {
     }
 
     pub fn remove(&mut self, key: String) -> Result<(), Box<dyn std::error::Error>> {
-        self.append_log(&format!("REMOVE {}", key))?;
+        let log = BinaryLog::remove(&key);
+        let serialized = self.serialize(&log);
+
+        self.append_log(&serialized)?;
+
         self.map.remove(&key);
 
         Ok(())
@@ -87,8 +147,9 @@ impl DB {
                     let tmp_log = open_log(&self.tmp_log_file, true)?;
                     let mut tmp_writer = BufWriter::new(tmp_log);
                     for (key, val) in self.map.iter() {
-                        let command = format!("SET {} {}", key, val);
-                        writeln!(tmp_writer, "{}", command)?;
+                        let log = BinaryLog::set(&key, &val);
+                        let serialized = self.serialize(&log);
+                        tmp_writer.write_all(&serialized)?;
                     }
                     tmp_writer.flush()?;
                 }
@@ -99,12 +160,78 @@ impl DB {
         Ok(())
     }
 
-    fn append_log(&self, command: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let mut log = open_log(&self.log_file, false)?;
-
-        writeln!(log, "{}", command)?;
-        log.flush()?;
+    fn append_log(&self, serialized: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+        let file = open_log(&self.log_file, false)?;
+        let mut writer = BufWriter::new(file);
+        writer.write_all(serialized)?;
+        writer.flush()?;
 
         Ok(())
+    }
+
+    fn deserialize(record: Vec<u8>) -> Result<BinaryLog, Box<dyn std::error::Error>> {
+        let mut pos = 0;
+
+        let stored_crc = u32::from_le_bytes(record[pos..pos + 4].try_into()?);
+        let computed_crc = DB::compute_crc(&record);
+
+        if computed_crc != stored_crc {
+            return Err("CRC mismatch".into());
+        }
+
+        pos += 4;
+
+        let timestamp = i64::from_le_bytes(record[pos..pos + 8].try_into()?);
+        pos += 8;
+
+        let operation = record[pos];
+        pos += 1;
+
+        let key_len = u32::from_le_bytes(record[pos..pos + 4].try_into()?) as usize;
+        pos += 4;
+
+        let val_len = u32::from_le_bytes(record[pos..pos + 4].try_into()?) as usize;
+        pos += 4;
+
+        let key = record[pos..pos + key_len].to_vec();
+        pos += key_len;
+
+        let value = record[pos..pos + val_len].to_vec();
+
+        Ok(BinaryLog {
+            crc: computed_crc,
+            key,
+            operation_type: OperationType::try_from(operation)
+                .map_err(|_| "invalid operation type")?,
+            timestamp,
+            val: value,
+        })
+    }
+
+    fn serialize(&self, log: &BinaryLog) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&log.crc.to_le_bytes());
+        bytes.extend_from_slice(&log.timestamp.to_le_bytes());
+        bytes.push(log.operation_type as u8);
+        bytes.extend_from_slice(&(log.key.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(log.val.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&log.key);
+        bytes.extend_from_slice(&log.val);
+
+        let crc = DB::compute_crc(&bytes);
+
+        bytes[0..4].copy_from_slice(&crc.to_le_bytes());
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        out.extend(bytes);
+
+        out
+    }
+
+    fn compute_crc(bytes: &[u8]) -> u32 {
+        let mut hasher = Hasher::new();
+        hasher.update(&bytes[4..]);
+        hasher.finalize()
     }
 }
