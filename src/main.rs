@@ -26,8 +26,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match args.command {
         Commands::Set { key, value } => db.set(key, value)?,
         Commands::Get { key } => match db.get(&key) {
-            Some(value) => println!("{value}"),
-            None => println!("key \"{}\" not found", key),
+            Ok(value) => println!("{}", value),
+            Err(e) => println!("{}", e),
         },
         Commands::Remove { key } => db.remove(key)?,
     };

@@ -1,9 +1,11 @@
 use chrono::Utc;
+use core::fmt;
 use crc32fast::Hasher;
 use std::fs;
 use std::io;
 use std::io::BufWriter;
 use std::io::Read;
+use std::io::Seek;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
@@ -30,12 +32,21 @@ impl TryFrom<u8> for OperationType {
     }
 }
 
-struct BinaryLog {
+pub struct BinaryLog {
     crc: u32,
     timestamp: i64,
     operation_type: OperationType,
     key: Vec<u8>,
     val: Vec<u8>,
+}
+
+impl fmt::Display for BinaryLog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match std::str::from_utf8(&self.val) {
+            Ok(s) => write!(f, "Value: {}", s),
+            Err(e) => write!(f, "Value: <invalid UTF-8: {}>", e),
+        }
+    }
 }
 
 impl BinaryLog {
@@ -60,10 +71,16 @@ impl BinaryLog {
     }
 }
 
+struct MapValue {
+    offset: u32,
+    record_size: u32,
+}
+
 pub struct DB {
-    map: HashMap<String, String>,
+    map: HashMap<String, MapValue>,
     log_file: PathBuf,
     tmp_log_file: PathBuf,
+    byte_counter: u32,
 }
 
 impl DB {
@@ -73,6 +90,7 @@ impl DB {
         let path = path.as_ref();
 
         let mut map = HashMap::new();
+        let mut byte_counter: u32 = 0;
 
         if path.exists() {
             let file = File::open(&path)?;
@@ -89,20 +107,28 @@ impl DB {
                     }
                 }
 
-                let record_len = u32::from_le_bytes(len_buf) as usize;
+                let record_len = u32::from_le_bytes(len_buf);
 
-                let mut record = vec![0u8; record_len];
+                let mut record = vec![0u8; record_len as usize];
 
                 reader.read_exact(&mut record)?;
 
-                let log = DB::deserialize(record)?;
+                let log = DB::deserialize(&record)?;
 
                 match log.operation_type {
-                    OperationType::Set => {
-                        map.insert(String::from_utf8(log.key)?, String::from_utf8(log.val)?)
-                    }
+                    OperationType::Set => map.insert(
+                        String::from_utf8(log.key)?,
+                        MapValue {
+                            offset: byte_counter,
+                            record_size: record_len,
+                        },
+                    ),
                     OperationType::Remove => map.remove(&String::from_utf8(log.key)?),
                 };
+
+                let total_len = record_len + std::mem::size_of::<u32>() as u32;
+
+                byte_counter += total_len;
             }
         }
 
@@ -110,6 +136,7 @@ impl DB {
             map,
             log_file: path.to_path_buf(),
             tmp_log_file: path.with_added_extension("tmp"),
+            byte_counter,
         })
     }
 
@@ -117,15 +144,45 @@ impl DB {
         let log = BinaryLog::set(&key, &value);
         let serialized = self.serialize(&log);
 
+        let record_len = serialized[..4].try_into()?;
+
+        let num = u32::from_le_bytes(record_len);
+
         self.append_log(&serialized)?;
 
-        self.map.insert(key, value);
+        self.map.insert(
+            key,
+            MapValue {
+                offset: self.byte_counter,
+                record_size: num,
+            },
+        );
+
+        let total_len = num + std::mem::size_of::<u32>() as u32;
+
+        self.byte_counter += total_len;
 
         Ok(())
     }
 
-    pub fn get(&self, key: &str) -> Option<&String> {
-        self.map.get(key)
+    pub fn get(&self, key: &str) -> Result<BinaryLog, Box<dyn std::error::Error>> {
+        let file = File::open(&self.log_file)?;
+        let mut reader = BufReader::new(file);
+
+        if let Some(value) = self.map.get(key) {
+            reader.seek(io::SeekFrom::Start(
+                value.offset as u64 + std::mem::size_of::<u32>() as u64,
+            ))?;
+
+            let mut record = vec![0u8; value.record_size as usize];
+
+            reader.read_exact(&mut record)?;
+
+            let log = DB::deserialize(&record)?;
+            Ok(log)
+        } else {
+            return Err("Key does not exist.".into());
+        }
     }
 
     pub fn remove(&mut self, key: String) -> Result<(), Box<dyn std::error::Error>> {
@@ -146,10 +203,19 @@ impl DB {
                 {
                     let tmp_log = open_log(&self.tmp_log_file, true)?;
                     let mut tmp_writer = BufWriter::new(tmp_log);
-                    for (key, val) in self.map.iter() {
-                        let log = BinaryLog::set(&key, &val);
-                        let serialized = self.serialize(&log);
-                        tmp_writer.write_all(&serialized)?;
+                    for (_, val) in self.map.iter() {
+                        let file = File::open(&self.log_file)?;
+                        let mut reader = BufReader::new(file);
+
+                        reader.seek(io::SeekFrom::Start(
+                            val.offset as u64 + std::mem::size_of::<u32>() as u64,
+                        ))?;
+
+                        let mut record = vec![0u8; val.record_size as usize];
+
+                        reader.read_exact(&mut record)?;
+
+                        tmp_writer.write_all(&record)?;
                     }
                     tmp_writer.flush()?;
                 }
@@ -169,7 +235,7 @@ impl DB {
         Ok(())
     }
 
-    fn deserialize(record: Vec<u8>) -> Result<BinaryLog, Box<dyn std::error::Error>> {
+    fn deserialize(record: &[u8]) -> Result<BinaryLog, Box<dyn std::error::Error>> {
         let mut pos = 0;
 
         let stored_crc = u32::from_le_bytes(record[pos..pos + 4].try_into()?);
