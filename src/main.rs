@@ -22,7 +22,7 @@ enum Commands {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    let mut db = DB::open("log")?;
+    let mut db = DB::open()?;
 
     match args.command {
         Commands::Set { key, value } => db.set(key, value)?,

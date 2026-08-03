@@ -1,3 +1,2 @@
 /target
-log
-log.tmp
+logs/
