@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 
 mod db;
 mod file;
+mod binarylog;
 
 use db::DB;
 

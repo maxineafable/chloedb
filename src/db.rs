@@ -1,6 +1,3 @@
-use chrono::Utc;
-use core::fmt;
-use crc32fast::Hasher;
 use std::fs;
 use std::io;
 use std::io::BufWriter;
@@ -12,64 +9,8 @@ use std::path::PathBuf;
 use std::{collections::HashMap, fs::File, io::BufReader};
 
 use crate::file::open_log;
+use crate::binarylog;
 
-#[derive(Debug, Clone, Copy)]
-#[repr(u8)]
-enum OperationType {
-    Set = 1,
-    Remove = 2,
-}
-
-impl TryFrom<u8> for OperationType {
-    type Error = ();
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            1 => Ok(OperationType::Set),
-            2 => Ok(OperationType::Remove),
-            _ => Err(()),
-        }
-    }
-}
-
-pub struct BinaryLog {
-    crc: u32,
-    timestamp: i64,
-    operation_type: OperationType,
-    key: Vec<u8>,
-    val: Vec<u8>,
-}
-
-impl fmt::Display for BinaryLog {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match std::str::from_utf8(&self.val) {
-            Ok(s) => write!(f, "Value: {}", s),
-            Err(e) => write!(f, "Value: <invalid UTF-8: {}>", e),
-        }
-    }
-}
-
-impl BinaryLog {
-    fn set(key: &str, value: &str) -> Self {
-        Self {
-            crc: 0,
-            timestamp: Utc::now().timestamp(),
-            operation_type: OperationType::Set,
-            key: key.as_bytes().to_vec(),
-            val: value.as_bytes().to_vec(),
-        }
-    }
-
-    fn remove(key: &str) -> Self {
-        Self {
-            crc: 0,
-            timestamp: Utc::now().timestamp(),
-            operation_type: OperationType::Remove,
-            key: key.as_bytes().to_vec(),
-            val: Vec::new(),
-        }
-    }
-}
 
 struct MapValue {
     offset: u32,
@@ -113,17 +54,17 @@ impl DB {
 
                 reader.read_exact(&mut record)?;
 
-                let log = DB::deserialize(&record)?;
+                let log = binarylog::BinaryLog::deserialize(&record)?;
 
-                match log.operation_type {
-                    OperationType::Set => map.insert(
-                        String::from_utf8(log.key)?,
+                match log.get_op_type() {
+                    binarylog::OperationType::Set => map.insert(
+                        str::from_utf8(log.get_key()).unwrap().to_string(),
                         MapValue {
                             offset: byte_counter,
                             record_size: record_len,
                         },
                     ),
-                    OperationType::Remove => map.remove(&String::from_utf8(log.key)?),
+                    binarylog::OperationType::Remove => map.remove(str::from_utf8(log.get_key())?),
                 };
 
                 let total_len = record_len + std::mem::size_of::<u32>() as u32;
@@ -141,9 +82,7 @@ impl DB {
     }
 
     pub fn set(&mut self, key: String, value: String) -> Result<(), Box<dyn std::error::Error>> {
-        let log = BinaryLog::set(&key, &value);
-        let serialized = self.serialize(&log);
-
+        let serialized = binarylog::BinaryLog::set(&key, &value);
         let record_len = serialized[..4].try_into()?;
 
         let num = u32::from_le_bytes(record_len);
@@ -165,7 +104,7 @@ impl DB {
         Ok(())
     }
 
-    pub fn get(&self, key: &str) -> Result<BinaryLog, Box<dyn std::error::Error>> {
+    pub fn get(&self, key: &str) -> Result<binarylog::BinaryLog, Box<dyn std::error::Error>> {
         let file = File::open(&self.log_file)?;
         let mut reader = BufReader::new(file);
 
@@ -178,7 +117,7 @@ impl DB {
 
             reader.read_exact(&mut record)?;
 
-            let log = DB::deserialize(&record)?;
+            let log = binarylog::BinaryLog::deserialize(&record)?;
             Ok(log)
         } else {
             return Err("Key does not exist.".into());
@@ -186,8 +125,7 @@ impl DB {
     }
 
     pub fn remove(&mut self, key: String) -> Result<(), Box<dyn std::error::Error>> {
-        let log = BinaryLog::remove(&key);
-        let serialized = self.serialize(&log);
+        let serialized = binarylog::BinaryLog::remove(&key);
 
         self.append_log(&serialized)?;
 
@@ -233,71 +171,5 @@ impl DB {
         writer.flush()?;
 
         Ok(())
-    }
-
-    fn deserialize(record: &[u8]) -> Result<BinaryLog, Box<dyn std::error::Error>> {
-        let mut pos = 0;
-
-        let stored_crc = u32::from_le_bytes(record[pos..pos + 4].try_into()?);
-        let computed_crc = DB::compute_crc(&record);
-
-        if computed_crc != stored_crc {
-            return Err("CRC mismatch".into());
-        }
-
-        pos += 4;
-
-        let timestamp = i64::from_le_bytes(record[pos..pos + 8].try_into()?);
-        pos += 8;
-
-        let operation = record[pos];
-        pos += 1;
-
-        let key_len = u32::from_le_bytes(record[pos..pos + 4].try_into()?) as usize;
-        pos += 4;
-
-        let val_len = u32::from_le_bytes(record[pos..pos + 4].try_into()?) as usize;
-        pos += 4;
-
-        let key = record[pos..pos + key_len].to_vec();
-        pos += key_len;
-
-        let value = record[pos..pos + val_len].to_vec();
-
-        Ok(BinaryLog {
-            crc: computed_crc,
-            key,
-            operation_type: OperationType::try_from(operation)
-                .map_err(|_| "invalid operation type")?,
-            timestamp,
-            val: value,
-        })
-    }
-
-    fn serialize(&self, log: &BinaryLog) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&log.crc.to_le_bytes());
-        bytes.extend_from_slice(&log.timestamp.to_le_bytes());
-        bytes.push(log.operation_type as u8);
-        bytes.extend_from_slice(&(log.key.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(&(log.val.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(&log.key);
-        bytes.extend_from_slice(&log.val);
-
-        let crc = DB::compute_crc(&bytes);
-
-        bytes[0..4].copy_from_slice(&crc.to_le_bytes());
-
-        let mut out = Vec::new();
-        out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-        out.extend(bytes);
-
-        out
-    }
-
-    fn compute_crc(bytes: &[u8]) -> u32 {
-        let mut hasher = Hasher::new();
-        hasher.update(&bytes[4..]);
-        hasher.finalize()
     }
 }
