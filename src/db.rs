@@ -22,12 +22,11 @@ pub struct DB {
     map: HashMap<String, MapValue>,
     active_file: PathBuf,
     active_file_id: u32,
-    tmp_log_file: PathBuf,
     byte_counter: u32,
 }
 
 impl DB {
-    const TEN_MB: u64 = 10 * 1024 * 1024;
+    // const TEN_MB: u64 = 10 * 1024 * 1024;
 
     pub fn open() -> Result<Self, Box<dyn std::error::Error>> {
         let dir = Path::new("logs");
@@ -99,13 +98,10 @@ impl DB {
             file_path = dir.join(format!("{:04}.log", file_id_counter));
         }
 
-        let tmp_log_file = file_path.with_added_extension("tmp");
-
         Ok(Self {
             map,
             active_file: file_path,
             active_file_id: file_id_counter,
-            tmp_log_file,
             byte_counter,
         })
     }
@@ -117,7 +113,6 @@ impl DB {
         let num = u32::from_le_bytes(record_len);
 
         let total_len = num + std::mem::size_of::<u32>() as u32;
-
 
         let append_log_total = self.byte_counter + total_len;
 
@@ -178,38 +173,67 @@ impl DB {
         Ok(())
     }
 
-    // TODO: merge/compact multi segment file
     pub fn compact_log(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if self.active_file.exists() {
-            let metadata = fs::metadata(&self.active_file)?;
-            if metadata.len() > DB::TEN_MB {
-                {
-                    let tmp_log = file::open_log(&self.tmp_log_file, true)?;
-                    let mut tmp_writer = BufWriter::new(tmp_log);
-                    for (_, val) in self.map.iter() {
-                        let file = File::open(&self.active_file)?;
-                        let mut reader = BufReader::new(file);
+        let log_file_count = self.get_log_file_count()?;
 
-                        reader.seek(io::SeekFrom::Start(
-                            val.offset as u64 + std::mem::size_of::<u32>() as u64,
-                        ))?;
+        let dir = Path::new("logs");
+        let tmp_file = "temp.log";
+        let tmp_path = dir.join(tmp_file);
 
-                        let mut record = vec![0u8; val.record_size as usize];
+        if log_file_count > 2 { // 2 files only to test log compaction
+            {
+                let tmp_log = File::create(&tmp_path)?;
+                let mut tmp_writer = BufWriter::new(tmp_log);
+                for (_, val) in self.map.iter() {
+                    let cur_path = dir.join(format!("{:04}.log", val.file_id));
 
-                        reader.read_exact(&mut record)?;
+                    let file = File::open(cur_path)?;
+                    let mut reader = BufReader::new(file);
 
-                        tmp_writer.write_all(&record)?;
-                    }
-                    tmp_writer.flush()?;
+                    reader.seek(io::SeekFrom::Start(
+                        val.offset as u64,
+                    ))?;
+
+                    let mut record = vec![0u8; val.record_size as usize + std::mem::size_of::<u32>() as usize];
+
+                    reader.read_exact(&mut record)?;
+
+                    tmp_writer.write_all(&record)?;
                 }
-                fs::rename(&self.tmp_log_file, &self.active_file)?;
+
+                tmp_writer.flush()?;
+
+                for read in fs::read_dir(dir)? {
+                    let read = read?;
+                    let path = read.path();
+
+                    if path.is_file() {
+                        match path.file_name() {
+                            Some(f) => {
+                                if f != tmp_file {
+                                    fs::remove_file(path)?;
+                                }
+                            }
+                            _ => (),
+                        }
+                    }
+                }
             }
+
+            self.active_file_id = 1;
+            let cur_path = dir.join(format!("{:04}.log", self.active_file_id));
+
+            fs::rename(tmp_path, cur_path)?;
         }
 
         Ok(())
     }
 
-    fn append_log(&mut self, serialized: &[u8], append_log_total: u32) -> Result<(), Box<dyn std::error::Error>> {
+    fn append_log(
+        &mut self,
+        serialized: &[u8],
+        append_log_total: u32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         self.check_log_threshold(append_log_total)?;
 
         let file = file::open_log(&self.active_file, false)?;
@@ -220,7 +244,10 @@ impl DB {
         Ok(())
     }
 
-    fn check_log_threshold(&mut self, append_log_total: u32) -> Result<(), Box<dyn std::error::Error>> {
+    fn check_log_threshold(
+        &mut self,
+        append_log_total: u32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let max_bytes = 70; // 70 bytes only to test multi log files
         println!("log_threshold byte counter: {}", self.byte_counter);
         if append_log_total >= max_bytes {
@@ -234,5 +261,16 @@ impl DB {
         }
 
         Ok(())
+    }
+
+    fn get_log_file_count(&self) -> Result<usize, Box<dyn std::error::Error>> {
+        let dir = Path::new("logs");
+
+        let read = fs::read_dir(dir)?;
+
+        Ok(read
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_type().map(|ft| ft.is_file()).unwrap_or(false))
+            .count())
     }
 }
