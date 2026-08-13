@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 
-use chloedb::db::DB;
+use chloedb::db::{DB, DBError};
 
 #[derive(Parser)]
 struct Args {
@@ -15,7 +15,7 @@ enum Commands {
     Remove { key: String },
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), DBError> {
     let args = Args::parse();
 
     let mut db = DB::open()?;

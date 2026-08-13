@@ -2,6 +2,8 @@ use chrono::Utc;
 use core::fmt;
 use crc32fast::Hasher;
 
+use crate::db::DBError;
+
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
 pub enum OperationType {
@@ -9,14 +11,27 @@ pub enum OperationType {
     Remove = 2,
 }
 
+#[derive(Debug)]
+pub enum OperationTypeError {
+    InvalidValue,
+}
+
+impl fmt::Display for OperationTypeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OperationTypeError::InvalidValue => write!(f, "Invalid operation type"),
+        }
+    }
+}
+
 impl TryFrom<u8> for OperationType {
-    type Error = ();
+    type Error = OperationTypeError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             1 => Ok(OperationType::Set),
             2 => Ok(OperationType::Remove),
-            _ => Err(()),
+            _ => Err(OperationTypeError::InvalidValue),
         }
     }
 }
@@ -71,14 +86,15 @@ impl BinaryLog {
         out
     }
 
-    pub fn deserialize(record: &[u8]) -> Result<BinaryLog, Box<dyn std::error::Error>> {
+    pub fn deserialize(record: &[u8]) -> Result<BinaryLog, DBError> {
         let mut pos = 0;
 
         let stored_crc = u32::from_le_bytes(record[pos..pos + 4].try_into()?);
         let computed_crc = BinaryLog::compute_crc(&record);
 
         if computed_crc != stored_crc {
-            return Err("CRC mismatch".into());
+            // return Err("CRC mismatch".into());
+            return Err(DBError::InvalidCRC);
         }
 
         pos += 4;
@@ -103,8 +119,9 @@ impl BinaryLog {
         Ok(BinaryLog {
             crc: computed_crc,
             key,
-            operation_type: OperationType::try_from(operation)
-                .map_err(|_| "invalid operation type")?,
+            operation_type: OperationType::try_from(operation)?,
+            // operation_type: OperationType::try_from(operation)
+            // .map_err(|_| "invalid operation type")?,
             timestamp,
             val: value,
         })

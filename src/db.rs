@@ -1,14 +1,18 @@
+use std::fmt;
 use std::fs;
 use std::io;
 use std::io::BufWriter;
 use std::io::Read;
 use std::io::Seek;
 use std::io::Write;
+use std::num::ParseIntError;
 use std::path::Path;
 use std::path::PathBuf;
+use std::str::Utf8Error;
 use std::{collections::HashMap, fs::File, io::BufReader};
 
 use crate::binarylog;
+use crate::binarylog::OperationTypeError;
 use crate::file;
 
 #[derive(Debug)]
@@ -26,8 +30,69 @@ pub struct DB {
     dir: PathBuf,
 }
 
+#[derive(Debug)]
+pub enum DBError {
+    NotLogTmp,
+    LogCountNotEnough,
+    InvalidSliceLength(std::array::TryFromSliceError),
+    KeyNotFound(String),
+    InvalidCRC,
+    InvalidOperationErr(OperationTypeError),
+    FailedParseFileId,
+    FailedByteKeyConvert,
+    IoError(std::io::Error),
+}
+
+impl fmt::Display for DBError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DBError::NotLogTmp => write!(f, "Failed removing non temporary log"),
+            DBError::LogCountNotEnough => write!(f, "Log file count not enough for compaction"),
+            DBError::InvalidSliceLength(err) => {
+                write!(f, "Invalid slice length to convert: {}", err)
+            }
+            DBError::KeyNotFound(key) => write!(f, "Key not found: {}", key),
+            DBError::InvalidCRC => write!(f, "Invalid CRC"),
+            DBError::InvalidOperationErr(err) => write!(f, "{}", err),
+            DBError::FailedParseFileId => write!(f, "Failed parsing file into id"),
+            DBError::FailedByteKeyConvert => write!(f, "Failed converting key bytes into String"),
+            DBError::IoError(io_err) => write!(f, "IO Error: {}", io_err),
+        }
+    }
+}
+
+impl From<std::io::Error> for DBError {
+    fn from(value: std::io::Error) -> Self {
+        DBError::IoError(value)
+    }
+}
+
+impl From<std::array::TryFromSliceError> for DBError {
+    fn from(err: std::array::TryFromSliceError) -> Self {
+        DBError::InvalidSliceLength(err)
+    }
+}
+
+impl From<OperationTypeError> for DBError {
+    fn from(error: OperationTypeError) -> Self {
+        DBError::InvalidOperationErr(error)
+    }
+}
+
+impl From<ParseIntError> for DBError {
+    fn from(_: ParseIntError) -> Self {
+        DBError::FailedParseFileId
+    }
+}
+
+impl From<Utf8Error> for DBError {
+    fn from(_: Utf8Error) -> Self {
+        DBError::FailedByteKeyConvert
+    }
+}
+
 impl DB {
-    pub fn open() -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn open() -> Result<Self, DBError> {
         let dir = Path::new("logs");
 
         let mut file_id_counter = 1;
@@ -106,7 +171,7 @@ impl DB {
         })
     }
 
-    pub fn set(&mut self, key: String, value: String) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn set(&mut self, key: String, value: String) -> Result<(), DBError> {
         let serialized = binarylog::BinaryLog::set(&key, &value);
         let record_len = serialized[..4].try_into()?;
 
@@ -129,7 +194,7 @@ impl DB {
         Ok(())
     }
 
-    pub fn get(&mut self, key: &str) -> Result<binarylog::BinaryLog, Box<dyn std::error::Error>> {
+    pub fn get(&mut self, key: &str) -> Result<binarylog::BinaryLog, DBError> {
         if let Some(value) = self.map.get(key) {
             let cur_path = file::format_log_file_path(&self.dir, value.file_id);
 
@@ -147,11 +212,12 @@ impl DB {
             let log = binarylog::BinaryLog::deserialize(&record)?;
             Ok(log)
         } else {
-            return Err("Key does not exist.".into());
+            // return Err("Key does not exist.".into());
+            Err(DBError::KeyNotFound(key.to_string()))
         }
     }
 
-    pub fn remove(&mut self, key: String) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn remove(&mut self, key: String) -> Result<(), DBError> {
         let serialized = binarylog::BinaryLog::remove(&key);
         let len_buf: [u8; 4] = serialized[0..4].try_into()?;
 
@@ -168,8 +234,9 @@ impl DB {
         Ok(())
     }
 
-    pub fn compact_log(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let log_file_count = file::get_log_file_count(None)?;
+    pub fn compact_log(&mut self) -> Result<(), DBError> {
+        let log_file_count =
+            file::get_log_file_count(None).map_err(|_| DBError::LogCountNotEnough)?;
 
         let tmp_file = "temp.log";
         let tmp_path = self.dir.join(tmp_file);
@@ -208,11 +275,7 @@ impl DB {
         Ok(())
     }
 
-    fn append_log(
-        &mut self,
-        serialized: &[u8],
-        append_log_total: u32,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn append_log(&mut self, serialized: &[u8], append_log_total: u32) -> Result<(), DBError> {
         if file::check_log_threshold(append_log_total) {
             self.set_new_active_file();
         }
@@ -232,7 +295,7 @@ impl DB {
         self.byte_counter = 0;
     }
 
-    fn remove_prev_log_files(&self, tmp_file: &str) -> Result<(), Box<dyn std::error::Error>> {
+    fn remove_prev_log_files(&self, tmp_file: &str) -> Result<(), DBError> {
         for read in fs::read_dir(&self.dir)? {
             let read = read?;
             let path = read.path();
@@ -241,10 +304,11 @@ impl DB {
                 match path.file_name() {
                     Some(f) => {
                         if f != tmp_file {
+                            // fs::remove_file(path).map_err(|_| DBError::NotLogTmp);
                             fs::remove_file(path)?;
                         }
-                    },
-                    None => println!("No matching filename")
+                    }
+                    None => println!("No matching filename"),
                 }
             }
         }

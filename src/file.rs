@@ -1,6 +1,9 @@
 use std::{
-    fs::{File, OpenOptions}, path::{Path, PathBuf},
+    fs::{File, OpenOptions},
+    path::{Path, PathBuf},
 };
+
+use crate::db::DBError;
 
 pub fn open_log(path: impl AsRef<Path>, is_temp: bool) -> Result<File, std::io::Error> {
     let path = path.as_ref();
@@ -17,7 +20,7 @@ pub fn open_log(path: impl AsRef<Path>, is_temp: bool) -> Result<File, std::io::
     opts.open(path)
 }
 
-pub fn get_log_file_count(dir_name: Option<&str>) -> Result<usize, Box<dyn std::error::Error>> {
+pub fn get_log_file_count(dir_name: Option<&str>) -> Result<usize, DBError> {
     let dir = dir_name.unwrap_or("logs");
 
     let read = std::fs::read_dir(dir)?;
