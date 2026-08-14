@@ -204,7 +204,7 @@ impl DB {
         if let Some(value) = self.map.get(key) {
             let cur_path = file::format_log_file_path(&self.dir, value.file_id);
 
-            let file = file::open_log(cur_path, false)?;
+            let file = File::open(cur_path)?;
             let mut reader = BufReader::new(file);
 
             reader.seek(io::SeekFrom::Start(
@@ -283,6 +283,7 @@ impl DB {
 
     fn append_log(&mut self, serialized: &[u8], append_log_total: u32) -> Result<(), DBError> {
         if file::check_log_threshold(append_log_total) {
+            self.set_prevlog_readonly()?;
             self.set_new_active_file();
         }
 
@@ -299,6 +300,14 @@ impl DB {
 
         self.active_file = file::format_log_file_path(&self.dir, self.active_file_id);
         self.byte_counter = 0;
+    }
+
+    fn set_prevlog_readonly(&self) -> Result<(), DBError> {
+        let mut file_perm = fs::metadata(&self.active_file)?.permissions();
+        file_perm.set_readonly(true);
+        fs::set_permissions(&self.active_file, file_perm)?;
+
+        Ok(())
     }
 
     fn remove_prev_log_files(&self, tmp_file: &str) -> Result<(), DBError> {
