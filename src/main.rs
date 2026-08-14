@@ -21,7 +21,10 @@ fn main() -> Result<(), DBError> {
     let mut db = DB::open()?;
 
     match args.command {
-        Commands::Set { key, value } => db.set(key, value)?,
+        Commands::Set { key, value } => match db.set(key, value) {
+            Ok(_) => (),
+            Err(e) => println!("{}", e),
+        },
         Commands::Get { key } => match db.get(&key) {
             Ok(value) => println!("{}", value),
             Err(e) => println!("{}", e),

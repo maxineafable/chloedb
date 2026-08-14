@@ -40,6 +40,7 @@ pub enum DBError {
     InvalidOperationErr(OperationTypeError),
     FailedParseFileId,
     FailedByteKeyConvert,
+    KeyAlreadyExists,
     IoError(std::io::Error),
 }
 
@@ -56,6 +57,7 @@ impl fmt::Display for DBError {
             DBError::InvalidOperationErr(err) => write!(f, "{}", err),
             DBError::FailedParseFileId => write!(f, "Failed parsing file into id"),
             DBError::FailedByteKeyConvert => write!(f, "Failed converting key bytes into String"),
+            DBError::KeyAlreadyExists => write!(f, "Key already exists"),
             DBError::IoError(io_err) => write!(f, "IO Error: {}", io_err),
         }
     }
@@ -172,6 +174,10 @@ impl DB {
     }
 
     pub fn set(&mut self, key: String, value: String) -> Result<(), DBError> {
+        if self.map.contains_key(&key) {
+            return Err(DBError::KeyAlreadyExists);
+        }
+
         let serialized = binarylog::BinaryLog::set(&key, &value);
         let record_len = serialized[..4].try_into()?;
 
