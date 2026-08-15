@@ -13,6 +13,7 @@ enum Commands {
     Set { key: String, value: String },
     Get { key: String },
     Remove { key: String },
+    List,
 }
 
 fn main() -> Result<(), DBError> {
@@ -30,6 +31,13 @@ fn main() -> Result<(), DBError> {
             Err(e) => println!("{}", e),
         },
         Commands::Remove { key } => db.remove(key)?,
+        Commands::List => {
+            let keys = db.list();
+            println!("Current Keys:");
+            for k in keys {
+                println!("{}", k);
+            }
+        }
     };
 
     db.compact_log()?;

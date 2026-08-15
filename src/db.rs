@@ -281,6 +281,10 @@ impl DB {
         Ok(())
     }
 
+    pub fn list(&self) -> Vec<&String> {
+        self.map.keys().collect()
+    }
+
     fn append_log(&mut self, serialized: &[u8], append_log_total: u32) -> Result<(), DBError> {
         if file::check_log_threshold(append_log_total) {
             self.set_prevlog_readonly()?;
