@@ -36,6 +36,45 @@ pub fn check_log_threshold(append_log_total: u32) -> bool {
     append_log_total >= MAX_BYTES
 }
 
-pub fn format_log_file_path(dir: &Path, file_id: u32) -> PathBuf {
-    dir.join(format!("{:04}.log", file_id))
+pub fn format_log_file_path(dir: impl AsRef<Path>, file_id: u32) -> PathBuf {
+    let path_ref = dir.as_ref();
+    path_ref.join(format!("{:04}.log", file_id))
+}
+
+pub fn remove_prev_log_files(dir: impl AsRef<Path>, tmp_file: &str) -> Result<(), DBError> {
+    let path_ref = dir.as_ref();
+
+    for read in std::fs::read_dir(path_ref)? {
+        let read = read?;
+        let path = read.path();
+
+        let metadata = std::fs::metadata(&path)?;
+        let mut perms = metadata.permissions();
+
+        if path.is_file() {
+            match path.file_name() {
+                Some(f) => {
+                    if f != tmp_file && perms.readonly() {
+                        perms.set_readonly(false);
+                        std::fs::set_permissions(&path, perms)?;
+
+                        std::fs::remove_file(path)?;
+                    }
+                }
+                None => println!("No matching filename"),
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub fn set_prevlog_readonly(file: impl AsRef<Path>) -> Result<(), DBError> {
+    let path_ref = file.as_ref();
+
+    let mut file_perm = std::fs::metadata(path_ref)?.permissions();
+    file_perm.set_readonly(true);
+    std::fs::set_permissions(path_ref, file_perm)?;
+
+    Ok(())
 }
