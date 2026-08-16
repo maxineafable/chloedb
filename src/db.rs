@@ -9,6 +9,8 @@ use std::num::ParseIntError;
 use std::path::Path;
 use std::path::PathBuf;
 use std::str::Utf8Error;
+use std::sync::{Arc, RwLock};
+use std::thread;
 use std::{collections::HashMap, fs::File, io::BufReader};
 
 use crate::binarylog;
@@ -23,7 +25,7 @@ struct MapValue {
 }
 
 pub struct DB {
-    map: HashMap<String, MapValue>,
+    map: Arc<RwLock<HashMap<String, MapValue>>>,
     active_file: PathBuf,
     active_file_id: u32,
     byte_counter: u32,
@@ -97,31 +99,38 @@ impl DB {
     pub fn open() -> Result<Self, DBError> {
         let dir = Path::new("logs");
 
-        let mut file_id_counter = 1;
-        let mut file_path = file::format_log_file_path(dir, file_id_counter);
-
         if !dir.exists() {
             std::fs::create_dir(dir)?;
         }
 
-        let mut map = HashMap::new();
-        let mut byte_counter: u32 = 0;
+        let map = Arc::new(RwLock::new(HashMap::new()));
+        let mut byte_counter = 0;
 
-        loop {
+        let map_clone = Arc::clone(&map);
+        let mut map_guard = map_clone.write().unwrap();
+
+        let mut file_id = 1;
+        let mut active_file = file::format_log_file_path(dir, file_id);
+
+        // Need to sort them to read log file sequentially
+        let entries = fs::read_dir(dir)?;
+        let mut paths: Vec<_> = entries.filter_map(|r| r.ok()).collect();
+        paths.sort_by_key(|dir| dir.path());
+
+        for read in paths {
+            let path = read.path();
+
             let mut file_offset: u32 = 0;
 
-            if !file_path.exists() {
-                if file_id_counter > 1 {
-                    file_id_counter -= 1;
-                    file_path = file::format_log_file_path(dir, file_id_counter);
-
-                    byte_counter = fs::metadata(&file_path)?.len() as u32;
-                }
-                println!("Reached end of sequence at {:?}.", file_path);
-                break;
+            if !path.is_file() {
+                continue;
             }
 
-            let file = File::open(&file_path)?;
+            active_file = PathBuf::from(&path);
+            byte_counter = fs::metadata(&path)?.len();
+            file_id = path.file_stem().unwrap().to_str().unwrap().parse()?;
+
+            let file = File::open(&path)?;
             let mut reader = BufReader::new(file);
 
             loop {
@@ -144,37 +153,43 @@ impl DB {
                 let log = binarylog::BinaryLog::deserialize(&record)?;
 
                 match log.get_op_type() {
-                    binarylog::OperationType::Set => map.insert(
+                    binarylog::OperationType::Set => map_guard.insert(
                         str::from_utf8(log.get_key()).unwrap().to_string(),
                         MapValue {
                             offset: file_offset,
                             record_size: record_len,
-                            file_id: file_path.file_stem().unwrap().to_str().unwrap().parse()?,
+                            file_id,
                         },
                     ),
-                    binarylog::OperationType::Remove => map.remove(str::from_utf8(log.get_key())?),
+                    binarylog::OperationType::Remove => {
+                        map_guard.remove(str::from_utf8(log.get_key())?)
+                    }
                 };
 
                 let total_len = record_len + std::mem::size_of::<u32>() as u32;
 
                 file_offset += total_len;
             }
-
-            file_id_counter += 1;
-            file_path = file::format_log_file_path(dir, file_id_counter);
         }
 
         Ok(Self {
             map,
-            active_file: file_path,
-            active_file_id: file_id_counter,
-            byte_counter,
+            active_file,
+            active_file_id: file_id,
+            byte_counter: byte_counter as u32,
             dir: dir.to_path_buf(),
         })
     }
 
     pub fn set(&mut self, key: String, value: String) -> Result<(), DBError> {
-        if self.map.contains_key(&key) {
+        let map_clone = Arc::clone(&self.map);
+
+        let has_key = {
+            let map_guard = map_clone.read().unwrap();
+            map_guard.contains_key(&key)
+        };
+
+        if has_key {
             return Err(DBError::KeyAlreadyExists);
         }
 
@@ -195,13 +210,17 @@ impl DB {
             file_id: self.active_file_id,
         };
 
-        self.map.insert(key, val);
+        let mut map_guard = map_clone.write().unwrap();
+        map_guard.insert(key, val);
 
         Ok(())
     }
 
     pub fn get(&mut self, key: &str) -> Result<binarylog::BinaryLog, DBError> {
-        if let Some(value) = self.map.get(key) {
+        let map_clone = Arc::clone(&self.map);
+        let map_guard = map_clone.read().unwrap();
+
+        if let Some(value) = map_guard.get(key) {
             let cur_path = file::format_log_file_path(&self.dir, value.file_id);
 
             let file = File::open(cur_path)?;
@@ -224,6 +243,9 @@ impl DB {
     }
 
     pub fn remove(&mut self, key: String) -> Result<(), DBError> {
+        let map_clone = Arc::clone(&self.map);
+        let mut map_guard = map_clone.write().unwrap();
+
         let serialized = binarylog::BinaryLog::remove(&key);
         let len_buf: [u8; 4] = serialized[0..4].try_into()?;
 
@@ -235,7 +257,7 @@ impl DB {
 
         self.append_log(&serialized, append_log_total)?;
 
-        self.map.remove(&key);
+        map_guard.remove(&key);
 
         Ok(())
     }
@@ -244,50 +266,81 @@ impl DB {
         let log_file_count =
             file::get_log_file_count(None).map_err(|_| DBError::LogCountNotEnough)?;
 
+        dbg!(log_file_count);
+
         let tmp_file = "temp.log";
         let tmp_path = self.dir.join(tmp_file);
 
-        if log_file_count > 2 {
-            // 2 files only to test log compaction
+        let map_clone = Arc::clone(&self.map);
+
+        let dir_clone = self.dir.clone();
+        let tmp_path_clone = tmp_path.clone();
+        let active_file_id_clone = self.active_file_id.clone();
+
+        // 3 files only to test log compaction
+        // after compaction, you'll have 2 log files:
+        // the active file and the temporary that's renamed
+        if log_file_count > 3 {
             {
-                let tmp_log = File::create(&tmp_path)?;
-                let mut tmp_writer = BufWriter::new(tmp_log);
-                for (_, val) in self.map.iter() {
-                    let cur_path = file::format_log_file_path(&self.dir, val.file_id);
+                let handle = thread::spawn(move || -> Result<(), DBError> {
+                    let map_guard = map_clone.read().unwrap();
 
-                    let file = File::open(cur_path)?;
-                    let mut reader = BufReader::new(file);
+                    let tmp_log = File::create(tmp_path_clone)?;
+                    let mut tmp_writer = BufWriter::new(tmp_log);
 
-                    reader.seek(io::SeekFrom::Start(val.offset as u64))?;
+                    for (_, val) in map_guard.iter() {
+                        // don't compact values currently in active file
+                        if val.file_id == active_file_id_clone {
+                            continue;
+                        }
 
-                    let mut record =
-                        vec![0u8; val.record_size as usize + std::mem::size_of::<u32>() as usize];
+                        let cur_path = file::format_log_file_path(&dir_clone, val.file_id);
 
-                    reader.read_exact(&mut record)?;
+                        let file = File::open(cur_path)?;
+                        let mut reader = BufReader::new(file);
 
-                    tmp_writer.write_all(&record)?;
-                }
+                        reader.seek(io::SeekFrom::Start(val.offset as u64))?;
 
-                tmp_writer.flush()?;
-                self.remove_prev_log_files(tmp_file)?;
+                        let mut record = vec![
+                            0u8;
+                            val.record_size as usize
+                                + std::mem::size_of::<u32>() as usize
+                        ];
+
+                        reader.read_exact(&mut record)?;
+
+                        tmp_writer.write_all(&record)?;
+                    }
+
+                    tmp_writer.flush()?;
+                    file::remove_prev_log_files(dir_clone, tmp_file)?;
+
+                    Ok(())
+                });
+
+                handle.join().unwrap()?;
             }
 
-            self.active_file_id = 1;
-            let cur_path = file::format_log_file_path(&self.dir, self.active_file_id);
+            let dest_tmp_log = self.active_file_id - 1;
+            let cur_path = file::format_log_file_path(&self.dir, dest_tmp_log);
 
-            fs::rename(tmp_path, cur_path)?;
+            fs::rename(tmp_path, &cur_path)?;
+            file::set_prevlog_readonly(cur_path)?;
         }
 
         Ok(())
     }
 
-    pub fn list(&self) -> Vec<&String> {
-        self.map.keys().collect()
+    pub fn list(&self) -> Vec<String> {
+        let map_clone = Arc::clone(&self.map);
+        let map_guard = map_clone.read().unwrap();
+
+        map_guard.keys().cloned().collect()
     }
 
     fn append_log(&mut self, serialized: &[u8], append_log_total: u32) -> Result<(), DBError> {
         if file::check_log_threshold(append_log_total) {
-            self.set_prevlog_readonly()?;
+            file::set_prevlog_readonly(&self.active_file)?;
             self.set_new_active_file();
         }
 
@@ -304,34 +357,5 @@ impl DB {
 
         self.active_file = file::format_log_file_path(&self.dir, self.active_file_id);
         self.byte_counter = 0;
-    }
-
-    fn set_prevlog_readonly(&self) -> Result<(), DBError> {
-        let mut file_perm = fs::metadata(&self.active_file)?.permissions();
-        file_perm.set_readonly(true);
-        fs::set_permissions(&self.active_file, file_perm)?;
-
-        Ok(())
-    }
-
-    fn remove_prev_log_files(&self, tmp_file: &str) -> Result<(), DBError> {
-        for read in fs::read_dir(&self.dir)? {
-            let read = read?;
-            let path = read.path();
-
-            if path.is_file() {
-                match path.file_name() {
-                    Some(f) => {
-                        if f != tmp_file {
-                            // fs::remove_file(path).map_err(|_| DBError::NotLogTmp);
-                            fs::remove_file(path)?;
-                        }
-                    }
-                    None => println!("No matching filename"),
-                }
-            }
-        }
-
-        Ok(())
     }
 }
