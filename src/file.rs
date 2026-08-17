@@ -41,28 +41,25 @@ pub fn format_log_file_path(dir: impl AsRef<Path>, file_id: u32) -> PathBuf {
     path_ref.join(format!("{:04}.log", file_id))
 }
 
-pub fn remove_prev_log_files(dir: impl AsRef<Path>, tmp_file: &str) -> Result<(), DBError> {
+pub fn remove_prev_log_files(dir: impl AsRef<Path>) -> Result<(), DBError> {
     let path_ref = dir.as_ref();
 
     for read in std::fs::read_dir(path_ref)? {
         let read = read?;
         let path = read.path();
 
+        if !path.is_file() {
+            continue;
+        }
+
         let metadata = std::fs::metadata(&path)?;
         let mut perms = metadata.permissions();
 
-        if path.is_file() {
-            match path.file_name() {
-                Some(f) => {
-                    if f != tmp_file && perms.readonly() {
-                        perms.set_readonly(false);
-                        std::fs::set_permissions(&path, perms)?;
+        if perms.readonly() {
+            perms.set_readonly(false);
+            std::fs::set_permissions(&path, perms)?;
 
-                        std::fs::remove_file(path)?;
-                    }
-                }
-                None => println!("No matching filename"),
-            }
+            std::fs::remove_file(path)?;
         }
     }
 

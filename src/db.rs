@@ -17,7 +17,7 @@ use crate::binarylog;
 use crate::binarylog::OperationTypeError;
 use crate::file;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct MapValue {
     offset: u32,
     record_size: u32,
@@ -266,7 +266,12 @@ impl DB {
         let log_file_count =
             file::get_log_file_count(None).map_err(|_| DBError::LogCountNotEnough)?;
 
-        dbg!(log_file_count);
+        // 3 files only to test log compaction
+        // after compaction, you'll have 2 log files:
+        // the active file and the temporary that's renamed
+        if log_file_count <= 3 {
+            return Ok(());
+        }
 
         let tmp_file = "temp.log";
         let tmp_path = self.dir.join(tmp_file);
@@ -277,56 +282,51 @@ impl DB {
         let tmp_path_clone = tmp_path.clone();
         let active_file_id_clone = self.active_file_id.clone();
 
-        // 3 files only to test log compaction
-        // after compaction, you'll have 2 log files:
-        // the active file and the temporary that's renamed
-        if log_file_count > 3 {
-            {
-                let handle = thread::spawn(move || -> Result<(), DBError> {
-                    let map_guard = map_clone.read().unwrap();
+        let handle = thread::spawn(move || -> Result<(), DBError> {
+            let map_entries: Vec<(String, MapValue)> = {
+                let map_guard = map_clone.read().unwrap();
+                map_guard
+                    .iter()
+                    // don't compact values currently in active file
+                    .filter(|(_, v)| v.file_id != active_file_id_clone)
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            };
 
-                    let tmp_log = File::create(tmp_path_clone)?;
-                    let mut tmp_writer = BufWriter::new(tmp_log);
+            let tmp_log = File::create(tmp_path_clone)?;
+            let mut tmp_writer = BufWriter::new(tmp_log);
 
-                    for (_, val) in map_guard.iter() {
-                        // don't compact values currently in active file
-                        if val.file_id == active_file_id_clone {
-                            continue;
-                        }
+            for (_, val) in map_entries {
+                let cur_path = file::format_log_file_path(&dir_clone, val.file_id);
 
-                        let cur_path = file::format_log_file_path(&dir_clone, val.file_id);
+                let file = File::open(cur_path)?;
+                let mut reader = BufReader::new(file);
 
-                        let file = File::open(cur_path)?;
-                        let mut reader = BufReader::new(file);
+                reader.seek(io::SeekFrom::Start(val.offset as u64))?;
 
-                        reader.seek(io::SeekFrom::Start(val.offset as u64))?;
+                let mut record =
+                    vec![0u8; val.record_size as usize + std::mem::size_of::<u32>() as usize];
 
-                        let mut record = vec![
-                            0u8;
-                            val.record_size as usize
-                                + std::mem::size_of::<u32>() as usize
-                        ];
+                reader.read_exact(&mut record)?;
 
-                        reader.read_exact(&mut record)?;
-
-                        tmp_writer.write_all(&record)?;
-                    }
-
-                    tmp_writer.flush()?;
-                    file::remove_prev_log_files(dir_clone, tmp_file)?;
-
-                    Ok(())
-                });
-
-                handle.join().unwrap()?;
+                tmp_writer.write_all(&record)?;
             }
 
-            let dest_tmp_log = self.active_file_id - 1;
-            let cur_path = file::format_log_file_path(&self.dir, dest_tmp_log);
+            tmp_writer.flush()?;
+            tmp_writer.get_ref().sync_all()?;
 
-            fs::rename(tmp_path, &cur_path)?;
-            file::set_prevlog_readonly(cur_path)?;
-        }
+            Ok(())
+        });
+
+        handle.join().unwrap()?;
+
+        let dest_tmp_log = self.active_file_id - 1;
+        let cur_path = file::format_log_file_path(&self.dir, dest_tmp_log);
+
+        fs::rename(tmp_path, &cur_path)?;
+
+        file::remove_prev_log_files(&self.dir)?;
+        file::set_prevlog_readonly(cur_path)?;
 
         Ok(())
     }
