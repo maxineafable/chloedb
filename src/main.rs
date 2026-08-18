@@ -30,7 +30,10 @@ fn main() -> Result<(), DBError> {
             Ok(value) => println!("{}", value),
             Err(e) => println!("{}", e),
         },
-        Commands::Remove { key } => db.remove(key)?,
+        Commands::Remove { key } => match db.remove(key) {
+            Ok(_) => (),
+            Err(e) => println!("{}", e),
+        },
         Commands::List => {
             let keys = db.list();
             println!("Current Keys:");

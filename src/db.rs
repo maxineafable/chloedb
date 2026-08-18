@@ -237,13 +237,22 @@ impl DB {
             let log = binarylog::BinaryLog::deserialize(&record)?;
             Ok(log)
         } else {
-            // return Err("Key does not exist.".into());
             Err(DBError::KeyNotFound(key.to_string()))
         }
     }
 
     pub fn remove(&mut self, key: String) -> Result<(), DBError> {
         let map_clone = Arc::clone(&self.map);
+
+        let no_key = {
+            let map_guard = map_clone.read().unwrap();
+            !map_guard.contains_key(&key)
+        };
+
+        if no_key {
+            return Err(DBError::KeyNotFound(key));
+        }
+
         let mut map_guard = map_clone.write().unwrap();
 
         let serialized = binarylog::BinaryLog::remove(&key);
