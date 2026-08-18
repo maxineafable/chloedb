@@ -2,7 +2,7 @@ use chrono::Utc;
 use core::fmt;
 use crc32fast::Hasher;
 
-use crate::db::DBError;
+use crate::error::DBError;
 
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]

@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::db::DBError;
+use crate::error::DBError;
 
 pub fn open_log(path: impl AsRef<Path>, is_temp: bool) -> Result<File, std::io::Error> {
     let path = path.as_ref();

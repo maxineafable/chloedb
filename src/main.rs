@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 
-use chloedb::db::{DB, DBError};
+use chloedb::db::DB;
+use chloedb::error::DBError;
 
 #[derive(Parser)]
 struct Args {

@@ -1,6 +1,7 @@
 pub mod db;
 pub mod file;
 pub mod binarylog;
+pub mod error;
 
 #[cfg(test)]
 mod tests {
