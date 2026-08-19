@@ -27,11 +27,13 @@ pub struct DB {
     active_file_id: u32,
     byte_counter: u32,
     dir: PathBuf,
+    max_bytes: u64,
+    max_logs: u32,
 }
 
 impl DB {
-    pub fn open() -> Result<Self, DBError> {
-        let dir = Path::new("logs");
+    pub fn open(dir: impl AsRef<Path>) -> Result<Self, DBError> {
+        let dir = dir.as_ref();
 
         if !dir.exists() {
             std::fs::create_dir(dir)?;
@@ -112,6 +114,8 @@ impl DB {
             active_file_id: file_id,
             byte_counter: byte_counter as u32,
             dir: dir.to_path_buf(),
+            max_bytes: 1024 * 1024, // 1 MB Default
+            max_logs: 5, // To trigger log compaction
         })
     }
 
@@ -207,7 +211,7 @@ impl DB {
 
     pub fn compact_log(&mut self) -> Result<(), DBError> {
         let log_file_count =
-            file::get_log_file_count(None).map_err(|_| DBError::LogCountNotEnough)?;
+            file::get_log_file_count(&self.dir).map_err(|_| DBError::LogCountNotEnough)?;
 
         // 3 files only to test log compaction
         // after compaction, you'll have 2 log files:
@@ -282,7 +286,7 @@ impl DB {
     }
 
     fn append_log(&mut self, serialized: &[u8], append_log_total: u32) -> Result<(), DBError> {
-        if file::check_log_threshold(append_log_total) {
+        if file::check_log_threshold(self.max_bytes, append_log_total) {
             file::set_prevlog_readonly(&self.active_file)?;
             self.set_new_active_file();
         }
@@ -301,4 +305,15 @@ impl DB {
         self.active_file = file::format_log_file_path(&self.dir, self.active_file_id);
         self.byte_counter = 0;
     }
+
+    pub fn set_max_bytes(mut self, bytes: u64) -> Self {
+        self.max_bytes = bytes;
+        self
+    }
+
+    pub fn set_max_logs(mut self, num: u32) -> Self {
+        self.max_logs = num;
+        self
+    }
+
 }

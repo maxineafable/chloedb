@@ -20,7 +20,9 @@ enum Commands {
 fn main() -> Result<(), DBError> {
     let args = Args::parse();
 
-    let mut db = DB::open()?;
+    let mut db = DB::open("./logs")?
+        .set_max_bytes(100)
+        .set_max_logs(3);
 
     match args.command {
         Commands::Set { key, value } => match db.set(key, value) {

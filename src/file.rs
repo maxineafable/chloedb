@@ -20,10 +20,10 @@ pub fn open_log(path: impl AsRef<Path>, is_temp: bool) -> Result<File, std::io::
     opts.open(path)
 }
 
-pub fn get_log_file_count(dir_name: Option<&str>) -> Result<usize, DBError> {
-    let dir = dir_name.unwrap_or("logs");
+pub fn get_log_file_count(dir: impl AsRef<Path>) -> Result<usize, DBError> {
+    let path_ref = dir.as_ref();
 
-    let read = std::fs::read_dir(dir)?;
+    let read = std::fs::read_dir(path_ref)?;
 
     Ok(read
         .filter_map(|entry| entry.ok())
@@ -31,9 +31,8 @@ pub fn get_log_file_count(dir_name: Option<&str>) -> Result<usize, DBError> {
         .count())
 }
 
-pub fn check_log_threshold(append_log_total: u32) -> bool {
-    const MAX_BYTES: u32 = 70; // 70 bytes only to test multi log files
-    append_log_total >= MAX_BYTES
+pub fn check_log_threshold(max_bytes: u64, append_log_total: u32) -> bool {
+    (append_log_total as u64) >= max_bytes
 }
 
 pub fn format_log_file_path(dir: impl AsRef<Path>, file_id: u32) -> PathBuf {
