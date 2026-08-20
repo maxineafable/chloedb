@@ -6,8 +6,6 @@ use std::io::Seek;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
-use std::thread;
 use std::{collections::HashMap, fs::File, io::BufReader};
 
 use crate::binarylog;
@@ -22,12 +20,12 @@ struct MapValue {
 }
 
 pub struct DB {
-    map: Arc<RwLock<HashMap<String, MapValue>>>,
+    map: HashMap<Vec<u8>, MapValue>,
     active_file: PathBuf,
     active_file_id: u32,
     byte_counter: u32,
     dir: PathBuf,
-    max_bytes: u64,
+    max_bytes: u32,
     max_logs: u32,
 }
 
@@ -39,11 +37,9 @@ impl DB {
             std::fs::create_dir(dir)?;
         }
 
-        let map = Arc::new(RwLock::new(HashMap::new()));
-        let mut byte_counter = 0;
+        let mut map: HashMap<Vec<u8>, MapValue> = HashMap::new();
 
-        let map_clone = Arc::clone(&map);
-        let mut map_guard = map_clone.write().unwrap();
+        let mut byte_counter: u32 = 0;
 
         let mut file_id = 1;
         let mut active_file = file::format_log_file_path(dir, file_id);
@@ -62,8 +58,11 @@ impl DB {
                 continue;
             }
 
-            active_file = PathBuf::from(&path);
-            byte_counter = fs::metadata(&path)?.len();
+            active_file = path.to_path_buf();
+            // TODO: temporary fix, handle the error from convert
+            // but for now it is safe if using the default 1 MB max log file
+            byte_counter = fs::metadata(&path)?.len().try_into().unwrap();
+
             file_id = path.file_stem().unwrap().to_str().unwrap().parse()?;
 
             let file = File::open(&path)?;
@@ -89,8 +88,8 @@ impl DB {
                 let log = binarylog::BinaryLog::deserialize(&record)?;
 
                 match log.get_op_type() {
-                    binarylog::OperationType::Set => map_guard.insert(
-                        str::from_utf8(log.get_key()).unwrap().to_string(),
+                    binarylog::OperationType::Set => map.insert(
+                        log.get_key(),
                         MapValue {
                             offset: file_offset,
                             record_size: record_len,
@@ -98,7 +97,7 @@ impl DB {
                         },
                     ),
                     binarylog::OperationType::Remove => {
-                        map_guard.remove(str::from_utf8(log.get_key())?)
+                        map.remove(&log.get_key())
                     }
                 };
 
@@ -108,30 +107,23 @@ impl DB {
             }
         }
 
-        Ok(Self {
-            map,
-            active_file,
-            active_file_id: file_id,
-            byte_counter: byte_counter as u32,
-            dir: dir.to_path_buf(),
-            max_bytes: 1024 * 1024, // 1 MB Default
-            max_logs: 5, // To trigger log compaction
+        Ok(DB {
+           map,
+           active_file,
+           active_file_id: file_id,
+           byte_counter,
+           dir: dir.to_path_buf(),
+           max_bytes: 1024 * 1024, // 1 MB Default
+           max_logs: 5, // To trigger log compaction
         })
     }
 
-    pub fn set(&mut self, key: String, value: String) -> Result<(), DBError> {
-        let map_clone = Arc::clone(&self.map);
-
-        let has_key = {
-            let map_guard = map_clone.read().unwrap();
-            map_guard.contains_key(&key)
-        };
-
-        if has_key {
+    pub fn set(&mut self, key: &[u8], value: &[u8]) -> Result<(), DBError> {
+        if self.map.contains_key(key) {
             return Err(DBError::KeyAlreadyExists);
         }
 
-        let serialized = binarylog::BinaryLog::set(&key, &value);
+        let serialized = binarylog::BinaryLog::set(key, value);
         let record_len = serialized[..4].try_into()?;
 
         let num = u32::from_le_bytes(record_len);
@@ -148,17 +140,14 @@ impl DB {
             file_id: self.active_file_id,
         };
 
-        let mut map_guard = map_clone.write().unwrap();
-        map_guard.insert(key, val);
+        self.map.insert(key.to_vec(), val);
+        self.byte_counter += append_log_total;
 
         Ok(())
     }
 
-    pub fn get(&mut self, key: &str) -> Result<binarylog::BinaryLog, DBError> {
-        let map_clone = Arc::clone(&self.map);
-        let map_guard = map_clone.read().unwrap();
-
-        if let Some(value) = map_guard.get(key) {
+    pub fn get(&self, key: &[u8]) -> Result<binarylog::BinaryLog, DBError> {
+        if let Some(value) = self.map.get(key) {
             let cur_path = file::format_log_file_path(&self.dir, value.file_id);
 
             let file = File::open(cur_path)?;
@@ -175,25 +164,16 @@ impl DB {
             let log = binarylog::BinaryLog::deserialize(&record)?;
             Ok(log)
         } else {
-            Err(DBError::KeyNotFound(key.to_string()))
+            Err(DBError::KeyNotFound)
         }
     }
 
-    pub fn remove(&mut self, key: String) -> Result<(), DBError> {
-        let map_clone = Arc::clone(&self.map);
-
-        let no_key = {
-            let map_guard = map_clone.read().unwrap();
-            !map_guard.contains_key(&key)
-        };
-
-        if no_key {
-            return Err(DBError::KeyNotFound(key));
+    pub fn remove(&mut self, key: &[u8]) -> Result<(), DBError> {
+        if !self.map.contains_key(key) {
+            return Err(DBError::KeyNotFound);
         }
 
-        let mut map_guard = map_clone.write().unwrap();
-
-        let serialized = binarylog::BinaryLog::remove(&key);
+        let serialized = binarylog::BinaryLog::remove(key);
         let len_buf: [u8; 4] = serialized[0..4].try_into()?;
 
         let record_len = u32::from_le_bytes(len_buf);
@@ -204,68 +184,41 @@ impl DB {
 
         self.append_log(&serialized, append_log_total)?;
 
-        map_guard.remove(&key);
+        self.map.remove(key);
+        self.byte_counter += append_log_total;
 
         Ok(())
     }
 
-    pub fn compact_log(&mut self) -> Result<(), DBError> {
-        let log_file_count =
-            file::get_log_file_count(&self.dir).map_err(|_| DBError::LogCountNotEnough)?;
-
-        // 3 files only to test log compaction
-        // after compaction, you'll have 2 log files:
-        // the active file and the temporary that's renamed
-        if log_file_count <= 3 {
-            return Ok(());
-        }
-
+    fn compact_log(&self) -> Result<(), DBError> {
         let tmp_file = "temp.log";
         let tmp_path = self.dir.join(tmp_file);
 
-        let map_clone = Arc::clone(&self.map);
+        let tmp_log = File::create(&tmp_path)?;
+        let mut tmp_writer = BufWriter::new(tmp_log);
 
-        let dir_clone = self.dir.clone();
-        let tmp_path_clone = tmp_path.clone();
-        let active_file_id_clone = self.active_file_id.clone();
-
-        let handle = thread::spawn(move || -> Result<(), DBError> {
-            let map_entries: Vec<(String, MapValue)> = {
-                let map_guard = map_clone.read().unwrap();
-                map_guard
-                    .iter()
-                    // don't compact values currently in active file
-                    .filter(|(_, v)| v.file_id != active_file_id_clone)
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect()
-            };
-
-            let tmp_log = File::create(tmp_path_clone)?;
-            let mut tmp_writer = BufWriter::new(tmp_log);
-
-            for (_, val) in map_entries {
-                let cur_path = file::format_log_file_path(&dir_clone, val.file_id);
-
-                let file = File::open(cur_path)?;
-                let mut reader = BufReader::new(file);
-
-                reader.seek(io::SeekFrom::Start(val.offset as u64))?;
-
-                let mut record =
-                    vec![0u8; val.record_size as usize + std::mem::size_of::<u32>() as usize];
-
-                reader.read_exact(&mut record)?;
-
-                tmp_writer.write_all(&record)?;
+        for (_, val) in self.map.iter() {
+            if val.file_id == self.active_file_id {
+                continue;
             }
 
-            tmp_writer.flush()?;
-            tmp_writer.get_ref().sync_all()?;
+            let cur_path = file::format_log_file_path(&self.dir, val.file_id);
 
-            Ok(())
-        });
+            let file = File::open(cur_path)?;
+            let mut reader = BufReader::new(file);
 
-        handle.join().unwrap()?;
+            reader.seek(io::SeekFrom::Start(val.offset as u64))?;
+
+            let mut record =
+                vec![0u8; val.record_size as usize + std::mem::size_of::<u32>() as usize];
+
+            reader.read_exact(&mut record)?;
+
+            tmp_writer.write_all(&record)?;
+        }
+
+        tmp_writer.flush()?;
+        tmp_writer.get_ref().sync_all()?;
 
         let dest_tmp_log = self.active_file_id - 1;
         let cur_path = file::format_log_file_path(&self.dir, dest_tmp_log);
@@ -278,17 +231,21 @@ impl DB {
         Ok(())
     }
 
-    pub fn list(&self) -> Vec<String> {
-        let map_clone = Arc::clone(&self.map);
-        let map_guard = map_clone.read().unwrap();
-
-        map_guard.keys().cloned().collect()
+    pub fn list(&self) -> Vec<Vec<u8>> {
+        self.map.keys().cloned().collect()
     }
 
     fn append_log(&mut self, serialized: &[u8], append_log_total: u32) -> Result<(), DBError> {
-        if file::check_log_threshold(self.max_bytes, append_log_total) {
+        let exceeded = file::log_threshold_exceed(self.max_bytes, append_log_total);
+        if self.active_file_id == 1 && exceeded {
+            return Err(DBError::ValueTooLarge);
+        }
+
+        if exceeded {
             file::set_prevlog_readonly(&self.active_file)?;
             self.set_new_active_file();
+
+            self.check_compaction()?;
         }
 
         let file = file::open_log(&self.active_file, false)?;
@@ -306,14 +263,27 @@ impl DB {
         self.byte_counter = 0;
     }
 
-    pub fn set_max_bytes(mut self, bytes: u64) -> Self {
+    pub fn set_max_bytes(mut self, bytes: u32) -> Self {
         self.max_bytes = bytes;
         self
     }
 
     pub fn set_max_logs(mut self, num: u32) -> Self {
-        self.max_logs = num;
-        self
+        if num < 3 {
+            self
+        } else {
+            self.max_logs = num;
+            self
+        }
     }
 
+    fn check_compaction(&self) -> Result<(), DBError>{
+        let count = file::get_log_file_count(&self.dir)?;
+
+        if count > (self.max_logs as usize) {
+            self.compact_log()?;
+        }
+
+        Ok(())
+    }
 }

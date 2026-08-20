@@ -1,7 +1,10 @@
-pub mod db;
-pub mod file;
-pub mod binarylog;
-pub mod error;
+mod db;
+mod file;
+mod binarylog;
+mod error;
+
+pub use db::DB;
+pub use error::DBError;
 
 #[cfg(test)]
 mod tests {
@@ -18,6 +21,6 @@ mod tests {
         // test 1 KB greater than default 1 MB threshold
         let kb = 1024;
         let mb = kb * kb;
-        assert!(!file::check_log_threshold(mb, kb as u32));
+        assert!(!file::log_threshold_exceed(mb, kb as u32));
     }
 }

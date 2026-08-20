@@ -2,8 +2,6 @@ use chrono::Utc;
 use core::fmt;
 use crc32fast::Hasher;
 
-use crate::error::DBError;
-
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
 pub enum OperationType {
@@ -12,30 +10,41 @@ pub enum OperationType {
 }
 
 #[derive(Debug)]
-pub enum OperationTypeError {
-    InvalidValue,
+pub enum BinaryLogError {
+    InvalidOperationType,
+    InvalidCRC,
+    InvalidSliceLength(std::array::TryFromSliceError),
 }
 
-impl fmt::Display for OperationTypeError {
+impl fmt::Display for BinaryLogError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            OperationTypeError::InvalidValue => write!(f, "Invalid operation type"),
+            BinaryLogError::InvalidOperationType => write!(f, "Invalid operation type"),
+            BinaryLogError::InvalidCRC => write!(f, "Invalid CRC"),
+            BinaryLogError::InvalidSliceLength(err) => {
+                write!(f, "Invalid slice length to convert: {}", err)
+            },
         }
     }
 }
 
 impl TryFrom<u8> for OperationType {
-    type Error = OperationTypeError;
+    type Error = BinaryLogError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             1 => Ok(OperationType::Set),
             2 => Ok(OperationType::Remove),
-            _ => Err(OperationTypeError::InvalidValue),
+            _ => Err(BinaryLogError::InvalidOperationType),
         }
     }
 }
 
+impl From<std::array::TryFromSliceError> for BinaryLogError {
+    fn from(err: std::array::TryFromSliceError) -> Self {
+        BinaryLogError::InvalidSliceLength(err)
+    }
+}
 pub struct BinaryLog {
     crc: u32,
     timestamp: i64,
@@ -45,22 +54,22 @@ pub struct BinaryLog {
 }
 
 impl BinaryLog {
-    pub fn set(key: &str, value: &str) -> Vec<u8> {
+    pub fn set(key: &[u8], value: &[u8]) -> Vec<u8> {
         BinaryLog::serialize(BinaryLog {
             crc: 0,
             timestamp: Utc::now().timestamp(),
             operation_type: OperationType::Set,
-            key: key.as_bytes().to_vec(),
-            val: value.as_bytes().to_vec(),
+            key: key.to_vec(),
+            val: value.to_vec(),
         })
     }
 
-    pub fn remove(key: &str) -> Vec<u8> {
+    pub fn remove(key: &[u8]) -> Vec<u8> {
         BinaryLog::serialize(BinaryLog {
             crc: 0,
             timestamp: Utc::now().timestamp(),
             operation_type: OperationType::Remove,
-            key: key.as_bytes().to_vec(),
+            key: key.to_vec(),
             val: Vec::new(),
         })
     }
@@ -86,15 +95,14 @@ impl BinaryLog {
         out
     }
 
-    pub fn deserialize(record: &[u8]) -> Result<BinaryLog, DBError> {
+    pub fn deserialize(record: &[u8]) -> Result<BinaryLog, BinaryLogError> {
         let mut pos = 0;
 
         let stored_crc = u32::from_le_bytes(record[pos..pos + 4].try_into()?);
         let computed_crc = BinaryLog::compute_crc(&record);
 
         if computed_crc != stored_crc {
-            // return Err("CRC mismatch".into());
-            return Err(DBError::InvalidCRC);
+            return Err(BinaryLogError::InvalidCRC);
         }
 
         pos += 4;
@@ -137,16 +145,16 @@ impl BinaryLog {
         self.operation_type
     }
 
-    pub fn get_key(&self) -> &[u8] {
-        &self.key
+    pub fn get_key(self) -> Vec<u8> {
+        self.key
     }
 }
 
 impl fmt::Display for BinaryLog {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match std::str::from_utf8(&self.val) {
-            Ok(s) => write!(f, "Value: {}", s),
-            Err(e) => write!(f, "Value: <invalid UTF-8: {}>", e),
+            Ok(s) => write!(f, "{}", s),
+            Err(e) => write!(f, "Error: {}", e),
         }
     }
 }

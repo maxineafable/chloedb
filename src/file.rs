@@ -31,8 +31,8 @@ pub fn get_log_file_count(dir: impl AsRef<Path>) -> Result<usize, DBError> {
         .count())
 }
 
-pub fn check_log_threshold(max_bytes: u64, append_log_total: u32) -> bool {
-    (append_log_total as u64) >= max_bytes
+pub fn log_threshold_exceed(max_bytes: u32, append_log_total: u32) -> bool {
+    append_log_total > max_bytes
 }
 
 pub fn format_log_file_path(dir: impl AsRef<Path>, file_id: u32) -> PathBuf {
